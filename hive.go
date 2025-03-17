@@ -1,251 +1,316 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"flag"
-	"fmt"
-	"log/slog"
-	"os"
-	"os/signal"
-	"regexp"
-	"sort"
-	"strings"
-	"time"
+    "context"
+    "errors"
+    "flag"
+    "fmt"
+    "log/slog"
+    "os"
+    "os/signal"
+    "regexp"
+    "sort"
+    "strings"
+    "time"
 
-	"github.com/ethereum/hive/internal/libdocker"
-	"github.com/ethereum/hive/internal/libhive"
-	"github.com/lmittmann/tint"
+    "github.com/ethereum/hive/internal/libdocker"
+    "github.com/ethereum/hive/internal/libhive"
+    "github.com/lmittmann/tint"
 )
 
-type buildArgs map[string]string
+// BuildArgs represents a map of build arguments for Docker
+type BuildArgs map[string]string
 
-func (args *buildArgs) String() string {
-	var kv []string
-	for k, v := range *args {
-		kv = append(kv, k+"="+v)
-	}
-	sort.Strings(kv)
-	return strings.Join(kv, ",")
+// String implements the Stringer interface for BuildArgs
+func (args BuildArgs) String() string {
+    var kv []string
+    for k, v := range args {
+        kv = append(kv, fmt.Sprintf("%s=%s", k, v))
+    }
+    sort.Strings(kv)
+    return strings.Join(kv, ",")
 }
 
-// Set implements flag.Value.
-func (args *buildArgs) Set(value string) error {
-	parts := strings.SplitN(value, "=", 2)
-	if len(parts) != 2 {
-		return errors.New("invalid build argument format, expected ARG=VALUE")
-	}
-	(*args)[parts[0]] = parts[1]
-	return nil
+// Set implements flag.Value interface for BuildArgs
+func (args BuildArgs) Set(value string) error {
+    parts := strings.SplitN(value, "=", 2)
+    if len(parts) != 2 {
+        return fmt.Errorf("invalid build argument format: %s, expected ARG=VALUE", value)
+    }
+    args[parts[0]] = parts[1]
+    return nil
+}
+
+// Config holds all configuration options for the Hive simulator
+type Config struct {
+    TestResultsRoot       string
+    LogLevel              int
+    DockerEndpoint        string
+    DockerNoCache         string
+    DockerPull            bool
+    DockerOutput          bool
+    DockerBuildOutput     bool
+    SimPattern            string
+    SimTestPattern        string
+    SimParallelism        int
+    SimRandomSeed         int
+    SimTestLimit          int // Deprecated
+    SimTimeLimit          time.Duration
+    SimLogLevel           int
+    SimDevMode            bool
+    SimDevModeAPIEndpoint string
+    UseCredHelper         bool
+    ClientsFile           string
+    Clients               string
+    ClientTimeout         time.Duration
+    SimBuildArgs          BuildArgs
 }
 
 func main() {
-	var (
-		testResultsRoot       = flag.String("results-root", "workspace/logs", "Target `directory` for results files and logs.")
-		loglevelFlag          = flag.Int("loglevel", 3, "Log `level` for system events. Supports values 0-5.")
-		dockerEndpoint        = flag.String("docker.endpoint", "", "Endpoint of the local Docker daemon.")
-		dockerNoCache         = flag.String("docker.nocache", "", "Regular `expression` selecting the docker images to forcibly rebuild.")
-		dockerPull            = flag.Bool("docker.pull", false, "Refresh base images when building images.")
-		dockerOutput          = flag.Bool("docker.output", false, "Relay all docker output to stderr.")
-		dockerBuildOutput     = flag.Bool("docker.buildoutput", false, "Relay only docker build output to stderr.")
-		simPattern            = flag.String("sim", "", "Regular `expression` selecting the simulators to run.")
-		simTestPattern        = flag.String("sim.limit", "", "Regular `expression` selecting tests/suites (interpreted by simulators).")
-		simParallelism        = flag.Int("sim.parallelism", 1, "Max `number` of parallel clients/containers (interpreted by simulators).")
-		simRandomSeed         = flag.Int("sim.randomseed", 0, "Randomness seed number (interpreted by simulators).")
-		simTestLimit          = flag.Int("sim.testlimit", 0, "[DEPRECATED] Max `number` of tests to execute per client (interpreted by simulators).")
-		simTimeLimit          = flag.Duration("sim.timelimit", 0, "Simulation `timeout`. Hive aborts the simulator if it exceeds this time.")
-		simLogLevel           = flag.Int("sim.loglevel", 3, "Selects log `level` of client instances. Supports values 0-5.")
-		simDevMode            = flag.Bool("dev", false, "Only starts the simulator API endpoint (listening at 127.0.0.1:3000 by default) without starting any simulators.")
-		simDevModeAPIEndpoint = flag.String("dev.addr", "127.0.0.1:3000", "Endpoint that the simulator API listens on")
-		useCredHelper         = flag.Bool("docker.cred-helper", false, "configure docker authentication using locally-configured credential helper")
+    config := parseFlags()
+    configureLogger(config.LogLevel)
+    
+    // Set GODEBUG for multipart handling
+    if err := os.Setenv("GODEBUG", "multipartmaxparts=20000"); err != nil {
+        fatal("failed to set GODEBUG:", err)
+    }
 
-		clientsFile = flag.String("client-file", "", `YAML `+"`file`"+` containing client configurations.`)
+    ctx, cancel := setupSignalHandling()
+    defer cancel()
 
-		clients = flag.String("client", "go-ethereum", "Comma separated `list` of clients to use. Client names in the list may be given as\n"+
-			"just the client name, or a client_branch specifier. If a branch name is supplied,\n"+
-			"the client image will use the given git branch or docker tag. Multiple instances of\n"+
-			"a single client type may be requested with different branches.\n"+
-			"Example: \"besu_latest,besu_20.10.2\"\n")
+    inv, err := libhive.LoadInventory(".")
+    if err != nil {
+        fatal("failed to load inventory:", err)
+    }
 
-		clientTimeout = flag.Duration("client.checktimelimit", 3*time.Minute, "The `timeout` of waiting for clients to open up the RPC port.\n"+
-			"If a very long chain is imported, this timeout may need to be quite large.\n"+
-			"A lower value means that hive won't wait as long in case the node crashes and\n"+
-			"never opens the RPC port.")
-	)
+    simulators, err := prepareSimulators(inv, config)
+    if err != nil {
+        fatal("failed to prepare simulators:", err)
+    }
 
-	// Add the sim.buildarg flag multiple times to allow multiple build arguments.
-	simBuildArgs := make(buildArgs)
-	flag.Var(&simBuildArgs, "sim.buildarg", "Argument to pass to the docker engine when building the simulator image, in the form of ARGNAME=VALUE.")
+    builder, cb, err := setupDocker(config, inv)
+    if err != nil {
+        fatal("failed to setup docker:", err)
+    }
 
-	// Parse the flags and configure the logger.
-	flag.Parse()
-	terminal := os.Getenv("TERM")
-	tintHandler := tint.NewHandler(os.Stderr, &tint.Options{
-		Level:   convertLogLevel(*loglevelFlag),
-		NoColor: terminal == "" || terminal == "dumb",
-	})
-	slog.SetDefault(slog.New(tintHandler))
-	// See: https://github.com/ethereum/hive/issues/1200.
-	if err := os.Setenv("GODEBUG", "multipartmaxparts=20000"); err != nil {
-		fatal(err)
-	}
-	if *simTestLimit > 0 {
-		slog.Warn("Option --sim.testlimit is deprecated and will have no effect.")
-	}
+    runner := libhive.NewRunner(inv, builder, cb)
+    clientList, err := prepareClients(inv, config)
+    if err != nil {
+        fatal("failed to prepare clients:", err)
+    }
 
-	// Get the list of simulators.
-	inv, err := libhive.LoadInventory(".")
-	if err != nil {
-		fatal(err)
-	}
-	simList, err := inv.MatchSimulators(*simPattern)
-	if err != nil {
-		fatal("bad --sim regular expression:", err)
-	}
-	if *simPattern != "" && len(simList) == 0 {
-		fatal("no simulators for pattern", *simPattern)
-	}
-	if *simPattern != "" && *simDevMode {
-		slog.Warn("--sim is ignored when using --dev mode")
-		simList = nil
-	}
+    hiveInfo := libhive.HiveInfo{
+        Command:    os.Args,
+        ClientFile: clientList,
+    }
 
-	// Create the docker backends.
-	dockerConfig := &libdocker.Config{
-		Inventory:           inv,
-		PullEnabled:         *dockerPull,
-		UseCredentialHelper: *useCredHelper,
-	}
-	if *dockerNoCache != "" {
-		re, err := regexp.Compile(*dockerNoCache)
-		if err != nil {
-			fatal("bad --docker-nocache regular expression:", err)
-		}
-		dockerConfig.NoCachePattern = re
-	}
-	if *dockerOutput {
-		dockerConfig.ContainerOutput = os.Stderr
-		dockerConfig.BuildOutput = os.Stderr
-	} else if *dockerBuildOutput {
-		dockerConfig.BuildOutput = os.Stderr
-	}
-	builder, cb, err := libdocker.Connect(*dockerEndpoint, dockerConfig)
-	if err != nil {
-		fatal(err)
-	}
+    if err := runner.Build(ctx, clientList, simulators, config.SimBuildArgs); err != nil {
+        fatal("build failed:", err)
+    }
 
-	// Set up the context for CLI interrupts.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-sig
-		cancel()
-	}()
+    if config.SimDevMode {
+        runner.RunDevMode(ctx, createSimEnv(config), config.SimDevModeAPIEndpoint, hiveInfo)
+        return
+    }
 
-	// Run.
-	env := libhive.SimEnv{
-		LogDir:             *testResultsRoot,
-		SimLogLevel:        *simLogLevel,
-		SimTestPattern:     *simTestPattern,
-		SimParallelism:     *simParallelism,
-		SimRandomSeed:      *simRandomSeed,
-		SimDurationLimit:   *simTimeLimit,
-		ClientStartTimeout: *clientTimeout,
-	}
-	runner := libhive.NewRunner(inv, builder, cb)
-
-	// Parse the client list.
-	// It can be supplied as a comma-separated list, or as a YAML file.
-	var clientList []libhive.ClientDesignator
-	if *clientsFile == "" {
-		clientList, err = libhive.ParseClientList(&inv, *clients)
-		if err != nil {
-			fatal("-client:", err)
-		}
-	} else {
-		clientList, err = parseClientsFile(&inv, *clientsFile)
-		if err != nil {
-			fatal("-client-file:", err)
-		}
-		// If YAML file is used, the list can be filtered by the -client flag.
-		if flagIsSet("client") {
-			filter := strings.Split(*clients, ",")
-			clientList = libhive.FilterClients(clientList, filter)
-		}
-	}
-	hiveInfo := libhive.HiveInfo{
-		Command:    os.Args,
-		ClientFile: clientList,
-	}
-
-	// Build clients and simulators.
-	if err := runner.Build(ctx, clientList, simList, simBuildArgs); err != nil {
-		fatal(err)
-	}
-	if *simDevMode {
-		runner.RunDevMode(ctx, env, *simDevModeAPIEndpoint, hiveInfo)
-		return
-	}
-
-	// Run simulators.
-	var failCount int
-	for _, sim := range simList {
-		result, err := runner.Run(ctx, sim, env, hiveInfo)
-		if err != nil {
-			fatal(err)
-		}
-		failCount += result.TestsFailed
-		slog.Info(fmt.Sprintf("simulation %s finished", sim), "suites", result.Suites, "tests", result.Tests, "failed", result.TestsFailed)
-	}
-
-	switch failCount {
-	case 0:
-	case 1:
-		fatal(errors.New("1 test failed"))
-	default:
-		fatal(fmt.Errorf("%d tests failed", failCount))
-	}
+    runSimulations(ctx, runner, simulators, config, hiveInfo)
 }
 
+// parseFlags parses command line flags and returns a Config
+func parseFlags() Config {
+    config := Config{
+        SimBuildArgs: make(BuildArgs),
+    }
+
+    flag.StringVar(&config.TestResultsRoot, "results-root", "workspace/logs", "Target directory for results files and logs")
+    flag.IntVar(&config.LogLevel, "loglevel", 3, "Log level for system events (0-5)")
+    flag.StringVar(&config.DockerEndpoint, "docker.endpoint", "", "Endpoint of the local Docker daemon")
+    flag.StringVar(&config.DockerNoCache, "docker.nocache", "", "Regular expression selecting docker images to forcibly rebuild")
+    flag.BoolVar(&config.DockerPull, "docker.pull", false, "Refresh base images when building images")
+    flag.BoolVar(&config.DockerOutput, "docker.output", false, "Relay all docker output to stderr")
+    flag.BoolVar(&config.DockerBuildOutput, "docker.buildoutput", false, "Relay only docker build output to stderr")
+    flag.StringVar(&config.SimPattern, "sim", "", "Regular expression selecting simulators to run")
+    flag.StringVar(&config.SimTestPattern, "sim.limit", "", "Regular expression selecting tests/suites")
+    flag.IntVar(&config.SimParallelism, "sim.parallelism", 1, "Max number of parallel clients/containers")
+    flag.IntVar(&config.SimRandomSeed, "sim.randomseed", 0, "Randomness seed number")
+    flag.IntVar(&config.SimTestLimit, "sim.testlimit", 0, "[DEPRECATED] Max number of tests per client")
+    flag.DurationVar(&config.SimTimeLimit, "sim.timelimit", 0, "Simulation timeout")
+    flag.IntVar(&config.SimLogLevel, "sim.loglevel", 3, "Log level for client instances (0-5)")
+    flag.BoolVar(&config.SimDevMode, "dev", false, "Run in development mode with API endpoint")
+    flag.StringVar(&config.SimDevModeAPIEndpoint, "dev.addr", "127.0.0.1:3000", "Simulator API endpoint")
+    flag.BoolVar(&config.UseCredHelper, "docker.cred-helper", false, "Use locally-configured credential helper for docker auth")
+    flag.StringVar(&config.ClientsFile, "client-file", "", "YAML file containing client configurations")
+    flag.StringVar(&config.Clients, "client", "go-ethereum", "Comma-separated list of clients")
+    flag.DurationVar(&config.ClientTimeout, "client.checktimelimit", 3*time.Minute, "Timeout for client RPC port opening")
+    flag.Var(&config.SimBuildArgs, "sim.buildarg", "Build argument for simulator image (ARGNAME=VALUE)")
+
+    flag.Parse()
+    return config
+}
+
+// configureLogger sets up the logging system
+func configureLogger(level int) {
+    terminal := os.Getenv("TERM")
+    handler := tint.NewHandler(os.Stderr, &tint.Options{
+        Level:   convertLogLevel(level),
+        NoColor: terminal == "" || terminal == "dumb",
+    })
+    slog.SetDefault(slog.New(handler))
+}
+
+// setupSignalHandling creates a context that cancels on interrupt
+func setupSignalHandling() (context.Context, context.CancelFunc) {
+    ctx, cancel := context.WithCancel(context.Background())
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, os.Interrupt)
+    go func() {
+        <-sig
+        cancel()
+    }()
+    return ctx, cancel
+}
+
+// prepareSimulators loads and matches simulators based on pattern
+func prepareSimulators(inv *libhive.Inventory, config Config) ([]string, error) {
+    if config.SimTestLimit > 0 {
+        slog.Warn("Option --sim.testlimit is deprecated and will have no effect")
+    }
+    
+    simList, err := inv.MatchSimulators(config.SimPattern)
+    if err != nil {
+        return nil, fmt.Errorf("bad simulator pattern: %w", err)
+    }
+    if config.SimPattern != "" && len(simList) == 0 {
+        return nil, fmt.Errorf("no simulators found for pattern: %s", config.SimPattern)
+    }
+    if config.SimPattern != "" && config.SimDevMode {
+        slog.Warn("--sim is ignored when using --dev mode")
+        return nil, nil
+    }
+    return simList, nil
+}
+
+// setupDocker configures and connects to the Docker daemon
+func setupDocker(config Config, inv *libhive.Inventory) (*libdocker.Builder, *libdocker.ContainerBackend, error) {
+    dockerConfig := &libdocker.Config{
+        Inventory:           inv,
+        PullEnabled:         config.DockerPull,
+        UseCredentialHelper: config.UseCredHelper,
+    }
+    
+    if config.DockerNoCache != "" {
+        re, err := regexp.Compile(config.DockerNoCache)
+        if err != nil {
+            return nil, nil, fmt.Errorf("bad docker nocache pattern: %w", err)
+        }
+        dockerConfig.NoCachePattern = re
+    }
+    
+    if config.DockerOutput {
+        dockerConfig.ContainerOutput = os.Stderr
+        dockerConfig.BuildOutput = os.Stderr
+    } else if config.DockerBuildOutput {
+        dockerConfig.BuildOutput = os.Stderr
+    }
+    
+    return libdocker.Connect(config.DockerEndpoint, dockerConfig)
+}
+
+// prepareClients loads and parses client configurations
+func prepareClients(inv *libhive.Inventory, config Config) ([]libhive.ClientDesignator, error) {
+    if config.ClientsFile == "" {
+        return libhive.ParseClientList(inv, config.Clients)
+    }
+    
+    clientList, err := parseClientsFile(inv, config.ClientsFile)
+    if err != nil {
+        return nil, err
+    }
+    
+    if flagIsSet("client") {
+        filter := strings.Split(config.Clients, ",")
+        clientList = libhive.FilterClients(clientList, filter)
+    }
+    return clientList, nil
+}
+
+// createSimEnv creates a simulation environment from config
+func createSimEnv(config Config) libhive.SimEnv {
+    return libhive.SimEnv{
+        LogDir:             config.TestResultsRoot,
+        SimLogLevel:        config.SimLogLevel,
+        SimTestPattern:     config.SimTestPattern,
+        SimParallelism:     config.SimParallelism,
+        SimRandomSeed:      config.SimRandomSeed,
+        SimDurationLimit:   config.SimTimeLimit,
+        ClientStartTimeout: config.ClientTimeout,
+    }
+}
+
+// runSimulations executes all simulations and handles results
+func runSimulations(ctx context.Context, runner *libhive.Runner, simulators []string, config Config, hiveInfo libhive.HiveInfo) {
+    var failCount int
+    for _, sim := range simulators {
+        result, err := runner.Run(ctx, sim, createSimEnv(config), hiveInfo)
+        if err != nil {
+            fatal("simulation failed:", err)
+        }
+        failCount += result.TestsFailed
+        slog.Info(fmt.Sprintf("Simulation %s completed", sim),
+            "suites", result.Suites,
+            "tests", result.Tests,
+            "failed", result.TestsFailed)
+    }
+
+    switch failCount {
+    case 0:
+        slog.Info("All tests passed successfully")
+    case 1:
+        fatal("tests failed:", errors.New("1 test failed"))
+    default:
+        fatal("tests failed:", fmt.Errorf("%d tests failed", failCount))
+    }
+}
+
+// fatal logs an error and exits with status 1
 func fatal(args ...interface{}) {
-	fmt.Fprintln(os.Stderr, args...)
-	os.Exit(1)
+    fmt.Fprintln(os.Stderr, args...)
+    os.Exit(1)
 }
 
+// parseClientsFile reads and parses a YAML client configuration file
 func parseClientsFile(inv *libhive.Inventory, file string) ([]libhive.ClientDesignator, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return libhive.ParseClientListYAML(inv, f)
+    f, err := os.Open(file)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open clients file: %w", err)
+    }
+    defer f.Close()
+    return libhive.ParseClientListYAML(inv, f)
 }
 
+// flagIsSet checks if a flag was explicitly set
 func flagIsSet(name string) bool {
-	var found bool
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
+    var found bool
+    flag.Visit(func(f *flag.Flag) {
+        if f.Name == name {
+            found = true
+        }
+    })
+    return found
 }
 
-// convertLogLevel maps log level from range 0-5 to the range used by package slog.
-// Input levels are ordered in increasing amounts of messages, i.e. level zero is silent
-// and level 5 means everything is printed.
+// convertLogLevel maps 0-5 range to slog levels
 func convertLogLevel(level int) slog.Level {
-	switch level {
-	case 0:
-		return 99
-	case 1:
-		return slog.LevelError
-	case 2:
-		return slog.LevelWarn
-	case 3:
-		return slog.LevelInfo
-	default:
-		return slog.LevelDebug
-	}
+    switch level {
+    case 0:
+        return slog.Level(99) // Silent
+    case 1:
+        return slog.LevelError
+    case 2:
+        return slog.LevelWarn
+    case 3:
+        return slog.LevelInfo
+    default:
+        return slog.LevelDebug
+    }
 }
